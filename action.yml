@@ -1,0 +1,462 @@
+name: Submit Allure Report
+description: Request GitHub OIDC token and submit a report bundle to Allure Report Host.
+
+inputs:
+  server-url:
+    description: Report host only (with or without scheme), for example reports.example.com or https://reports.example.com
+    required: true
+  path:
+    description: Path to allure-results directory or zip file
+    required: true
+  report-name:
+    description: Report name; defaults to a stable job-based suite name
+    required: false
+    default: ""
+  branch:
+    description: Branch label sent to backend; defaults to github.ref_name
+    required: false
+    default: ""
+  report-type:
+    description: Report type (allure or raw)
+    required: false
+    default: allure
+  audience:
+    description: OIDC audience to request; defaults to resolved host[:port]
+    required: false
+    default: ""
+  project-name:
+    description: Optional owner/repo override. For OIDC this must match token repository when provided.
+    required: false
+    default: ""
+  api-key:
+    description: Optional API key fallback for local/manual uploads
+    required: false
+    default: ""
+  publish-commit-check:
+    description: Publish a GitHub Check Run on the commit with report summary and link
+    required: false
+    default: "true"
+  check-name-prefix:
+    description: Prefix used for the commit check name
+    required: false
+    default: "Test Report"
+
+outputs:
+  report-version-id:
+    description: Stored report version id
+    value: ${{ steps.upload.outputs.report_version_id }}
+  report-url:
+    description: Report content URL returned by backend
+    value: ${{ steps.upload.outputs.report_url }}
+  report-url-absolute:
+    description: Absolute report URL
+    value: ${{ steps.upload.outputs.report_url_absolute }}
+  project-name:
+    description: Effective project (repository)
+    value: ${{ steps.upload.outputs.project_name }}
+  report-name:
+    description: Effective report name sent to backend
+    value: ${{ steps.upload.outputs.report_name }}
+  total:
+    description: Total detected test count (allure only)
+    value: ${{ steps.stats.outputs.total }}
+  passed:
+    description: Passed test count (allure only)
+    value: ${{ steps.stats.outputs.passed }}
+  failed:
+    description: Failed test count (allure only)
+    value: ${{ steps.stats.outputs.failed }}
+  broken:
+    description: Broken test count (allure only)
+    value: ${{ steps.stats.outputs.broken }}
+  skipped:
+    description: Skipped test count (allure only)
+    value: ${{ steps.stats.outputs.skipped }}
+  unknown:
+    description: Unknown test count (allure only)
+    value: ${{ steps.stats.outputs.unknown }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check token access
+      shell: bash
+      run: |
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "OIDC token access is unavailable." >&2
+          echo "Set workflow/job permissions: id-token: write, contents: read" >&2
+          exit 1
+        fi
+
+    - name: Prepare report archive
+      id: archive
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        INPUT_PATH="${INPUT_PATH}"
+        if [ -d "${INPUT_PATH}" ]; then
+          ZIP_PATH="${RUNNER_TEMP}/allure-report-${GITHUB_RUN_ID}.zip"
+          (cd "${INPUT_PATH}" && zip -q -r "${ZIP_PATH}" .)
+          echo "zip_path=${ZIP_PATH}" >> "${GITHUB_OUTPUT}"
+        elif [ -f "${INPUT_PATH}" ] && [[ "${INPUT_PATH}" == *.zip ]]; then
+          echo "zip_path=${INPUT_PATH}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "Input path must be a directory or .zip file: ${INPUT_PATH}" >&2
+          exit 1
+        fi
+
+    - name: Resolve server endpoint
+      id: server
+      shell: bash
+      env:
+        INPUT_SERVER_URL: ${{ inputs.server-url }}
+      run: |
+        set -euo pipefail
+
+        raw="$(printf '%s' "${INPUT_SERVER_URL}" | tr -d '\r' | xargs)"
+        raw="${raw%/}"
+        if [ -z "${raw}" ]; then
+          echo "server-url is required" >&2
+          exit 1
+        fi
+
+        has_scheme=0
+        scheme=""
+        host_port="${raw}"
+        if [[ "${raw}" =~ ^https?:// ]]; then
+          has_scheme=1
+          scheme="${raw%%://*}"
+          host_port="${raw#*://}"
+        fi
+
+        if [[ "${host_port}" == *"/"* ]] || [[ "${host_port}" == *"?"* ]] || [[ "${host_port}" == *"#"* ]] || [[ "${host_port}" == *"@"* ]]; then
+          echo "server-url must be host-only (no path/query/fragment/userinfo)." >&2
+          exit 1
+        fi
+        if [ -z "${host_port}" ]; then
+          echo "server-url host is empty" >&2
+          exit 1
+        fi
+
+        host="${host_port}"
+        port=""
+        if [[ "${host_port}" == *:* ]]; then
+          host="${host_port%%:*}"
+          port="${host_port##*:}"
+          if [ -z "${host}" ] || [ -z "${port}" ] || ! [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then
+            echo "server-url has invalid port" >&2
+            exit 1
+          fi
+        fi
+
+        valid_host=0
+        if [[ "${host}" == "localhost" ]]; then
+          valid_host=1
+        elif [[ "${host}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+          valid_host=1
+        elif [[ "${host}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+          valid_host=1
+          IFS='.' read -r -a labels <<< "${host}"
+          for label in "${labels[@]}"; do
+            if [ -z "${label}" ] || [[ ! "${label}" =~ ^[A-Za-z0-9-]+$ ]] || [[ "${label}" == -* ]] || [[ "${label}" == *- ]]; then
+              valid_host=0
+              break
+            fi
+          done
+        fi
+
+        if [ "${valid_host}" -ne 1 ]; then
+          echo "server-url host is not a valid domain/IP/localhost: ${host}" >&2
+          exit 1
+        fi
+
+        endpoint_path="/api/reports/upload"
+        if [ "${has_scheme}" -eq 1 ]; then
+          primary_url="${scheme}://${host_port}${endpoint_path}"
+          secondary_url=""
+        else
+          if [[ "${host}" == "localhost" || "${host}" == "127."* || "${host}" == "0.0.0.0" ]]; then
+            primary_url="http://${host_port}${endpoint_path}"
+            secondary_url="https://${host_port}${endpoint_path}"
+          else
+            primary_url="https://${host_port}${endpoint_path}"
+            secondary_url="http://${host_port}${endpoint_path}"
+          fi
+        fi
+
+        echo "audience=${host_port}" >> "${GITHUB_OUTPUT}"
+        echo "primary_url=${primary_url}" >> "${GITHUB_OUTPUT}"
+        echo "secondary_url=${secondary_url}" >> "${GITHUB_OUTPUT}"
+
+    - name: Request OIDC token
+      id: oidc
+      shell: bash
+      env:
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+        RESOLVED_AUDIENCE: ${{ steps.server.outputs.audience }}
+      run: |
+        set -euo pipefail
+        audience="${INPUT_AUDIENCE}"
+        if [ -z "${audience}" ]; then
+          audience="${RESOLVED_AUDIENCE}"
+        fi
+
+        response="$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}")"
+
+        token="$(printf '%s' "${response}" | jq -r '.value // empty')"
+        if [ -z "${token}" ]; then
+          echo "Failed to obtain OIDC token from response" >&2
+          echo "${response}" >&2
+          exit 1
+        fi
+
+        echo "::add-mask::${token}"
+        echo "token=${token}" >> "${GITHUB_OUTPUT}"
+
+    - name: Upload report
+      id: upload
+      shell: bash
+      env:
+        UPLOAD_URL_PRIMARY: ${{ steps.server.outputs.primary_url }}
+        UPLOAD_URL_SECONDARY: ${{ steps.server.outputs.secondary_url }}
+        INPUT_REPORT_NAME: ${{ inputs.report-name }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_REPORT_TYPE: ${{ inputs.report-type }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        ZIP_PATH: ${{ steps.archive.outputs.zip_path }}
+        TOKEN: ${{ steps.oidc.outputs.token }}
+      run: |
+        set -euo pipefail
+
+        REPORT_NAME="${INPUT_REPORT_NAME}"
+        if [ -z "${REPORT_NAME}" ]; then
+          REPORT_NAME="${GITHUB_JOB:-tests}"
+          REPORT_NAME="$(printf '%s' "${REPORT_NAME}" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g')"
+          if [ -z "${REPORT_NAME}" ]; then
+            REPORT_NAME="tests"
+          fi
+        fi
+
+        BRANCH="${INPUT_BRANCH}"
+        if [ -z "${BRANCH}" ]; then
+          BRANCH="${GITHUB_REF_NAME}"
+        fi
+        BRANCH="${BRANCH//\//-}"
+        BRANCH="${BRANCH//\\/-}"
+        BRANCH="${BRANCH// /-}"
+
+        response_file="${RUNNER_TEMP}/upload-response.json"
+        upload_once() {
+          local url="$1"
+          set +e
+          local code
+          code="$(curl -sS \
+            -o "${response_file}" \
+            -w '%{http_code}' \
+            -X POST "${url}" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            ${INPUT_API_KEY:+-H "X-API-Key: ${INPUT_API_KEY}"} \
+            -F "branch=${BRANCH}" \
+            -F "report_name=${REPORT_NAME}" \
+            -F "type=${INPUT_REPORT_TYPE}" \
+            ${INPUT_PROJECT_NAME:+-F "project_name=${INPUT_PROJECT_NAME}"} \
+            -F "file=@${ZIP_PATH}")"
+          local curl_status=$?
+          set -e
+
+          if [ "${curl_status}" -ne 0 ]; then
+            return 100
+          fi
+          printf '%s' "${code}"
+          return 0
+        }
+
+        used_url=""
+        http_code=""
+        for candidate in "${UPLOAD_URL_PRIMARY}" "${UPLOAD_URL_SECONDARY}"; do
+          if [ -z "${candidate}" ]; then
+            continue
+          fi
+          if http_code="$(upload_once "${candidate}")"; then
+            used_url="${candidate}"
+            break
+          fi
+        done
+
+        if [ -z "${used_url}" ]; then
+          echo "Upload failed. Unable to reach ${UPLOAD_URL_PRIMARY} or fallback URL." >&2
+          exit 1
+        fi
+
+        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+          echo "Upload failed with HTTP ${http_code} (${used_url})" >&2
+          cat "${response_file}" >&2
+          exit 1
+        fi
+
+        report_version_id="$(jq -r '.report_version_id // empty' "${response_file}")"
+        report_url="$(jq -r '.url // empty' "${response_file}")"
+        origin="$(printf '%s' "${used_url}" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+        report_url_absolute="${report_url}"
+        if [[ "${report_url_absolute}" == /* ]]; then
+          report_url_absolute="${origin}${report_url_absolute}"
+        fi
+        project_name="${INPUT_PROJECT_NAME}"
+        if [ -z "${project_name}" ]; then
+          project_name="${GITHUB_REPOSITORY}"
+        fi
+
+        echo "report_version_id=${report_version_id}" >> "${GITHUB_OUTPUT}"
+        echo "report_url=${report_url}" >> "${GITHUB_OUTPUT}"
+        echo "report_url_absolute=${report_url_absolute}" >> "${GITHUB_OUTPUT}"
+        echo "project_name=${project_name}" >> "${GITHUB_OUTPUT}"
+        echo "report_name=${REPORT_NAME}" >> "${GITHUB_OUTPUT}"
+
+        cp "${response_file}" "${GITHUB_WORKSPACE}/upload-response.json"
+
+    - name: Compute report stats
+      id: stats
+      shell: bash
+      env:
+        INPUT_REPORT_TYPE: ${{ inputs.report-type }}
+        ZIP_PATH: ${{ steps.archive.outputs.zip_path }}
+      run: |
+        set -euo pipefail
+
+        report_type="$(printf '%s' "${INPUT_REPORT_TYPE}" | tr '[:upper:]' '[:lower:]')"
+        passed=0
+        failed=0
+        broken=0
+        skipped=0
+        unknown=0
+        total=0
+
+        if [ "${report_type}" = "allure" ]; then
+          scan_dir="${RUNNER_TEMP}/allure-stats-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "${scan_dir}"
+          mkdir -p "${scan_dir}"
+          unzip -qq -o "${ZIP_PATH}" -d "${scan_dir}"
+
+          while IFS= read -r -d '' result_json; do
+            status="$(jq -r '.status // empty' "${result_json}" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+            case "${status}" in
+              passed) passed=$((passed + 1)) ;;
+              failed) failed=$((failed + 1)) ;;
+              broken) broken=$((broken + 1)) ;;
+              skipped) skipped=$((skipped + 1)) ;;
+              unknown|"") unknown=$((unknown + 1)) ;;
+              *) unknown=$((unknown + 1)) ;;
+            esac
+          done < <(find "${scan_dir}" -type f -name '*-result.json' -print0)
+        fi
+
+        total=$((passed + failed + broken + skipped + unknown))
+        echo "total=${total}" >> "${GITHUB_OUTPUT}"
+        echo "passed=${passed}" >> "${GITHUB_OUTPUT}"
+        echo "failed=${failed}" >> "${GITHUB_OUTPUT}"
+        echo "broken=${broken}" >> "${GITHUB_OUTPUT}"
+        echo "skipped=${skipped}" >> "${GITHUB_OUTPUT}"
+        echo "unknown=${unknown}" >> "${GITHUB_OUTPUT}"
+
+    - name: Publish report summary
+      shell: bash
+      env:
+        INPUT_REPORT_TYPE: ${{ inputs.report-type }}
+        REPORT_NAME: ${{ steps.upload.outputs.report_name }}
+        PROJECT_NAME: ${{ steps.upload.outputs.project_name }}
+        REPORT_VERSION_ID: ${{ steps.upload.outputs.report_version_id }}
+        REPORT_URL_ABSOLUTE: ${{ steps.upload.outputs.report_url_absolute }}
+        TOTAL: ${{ steps.stats.outputs.total }}
+        PASSED: ${{ steps.stats.outputs.passed }}
+        FAILED: ${{ steps.stats.outputs.failed }}
+        BROKEN: ${{ steps.stats.outputs.broken }}
+        SKIPPED: ${{ steps.stats.outputs.skipped }}
+        UNKNOWN: ${{ steps.stats.outputs.unknown }}
+      run: |
+        set -euo pipefail
+        report_type="$(printf '%s' "${INPUT_REPORT_TYPE}" | tr '[:upper:]' '[:lower:]')"
+        {
+          echo "### Report Uploaded: ${REPORT_NAME}"
+          echo ""
+          echo "- Project: \`${PROJECT_NAME}\`"
+          echo "- Type: \`${report_type}\`"
+          echo "- Version: \`${REPORT_VERSION_ID}\`"
+          if [ "${report_type}" = "allure" ]; then
+            echo "- Results: \`${PASSED} passed\`, \`${FAILED} failed\`, \`${BROKEN} broken\`, \`${SKIPPED} skipped\`, \`${UNKNOWN} unknown\` (total \`${TOTAL}\`)"
+          fi
+          echo "- Link: ${REPORT_URL_ABSOLUTE}"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Publish commit check
+      if: ${{ inputs.publish-commit-check == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        INPUT_REPORT_TYPE: ${{ inputs.report-type }}
+        CHECK_NAME_PREFIX: ${{ inputs.check-name-prefix }}
+        REPORT_NAME: ${{ steps.upload.outputs.report_name }}
+        PROJECT_NAME: ${{ steps.upload.outputs.project_name }}
+        REPORT_VERSION_ID: ${{ steps.upload.outputs.report_version_id }}
+        REPORT_URL_ABSOLUTE: ${{ steps.upload.outputs.report_url_absolute }}
+        TOTAL: ${{ steps.stats.outputs.total }}
+        PASSED: ${{ steps.stats.outputs.passed }}
+        FAILED: ${{ steps.stats.outputs.failed }}
+        BROKEN: ${{ steps.stats.outputs.broken }}
+        SKIPPED: ${{ steps.stats.outputs.skipped }}
+        UNKNOWN: ${{ steps.stats.outputs.unknown }}
+      run: |
+        set -euo pipefail
+        report_type="$(printf '%s' "${INPUT_REPORT_TYPE}" | tr '[:upper:]' '[:lower:]')"
+        check_name="${CHECK_NAME_PREFIX}: ${REPORT_NAME}"
+
+        if [ "${report_type}" = "allure" ]; then
+          stats_line="${PASSED} passed, ${FAILED} failed, ${BROKEN} broken, ${SKIPPED} skipped, ${UNKNOWN} unknown (total ${TOTAL})"
+        else
+          stats_line="raw report uploaded"
+        fi
+
+        summary="$(cat <<EOF
+        Report name: ${REPORT_NAME}
+        
+        Project: ${PROJECT_NAME}
+        Type: ${report_type}
+        Report version: ${REPORT_VERSION_ID}
+        Results: ${stats_line}
+        Open report: ${REPORT_URL_ABSOLUTE}
+        EOF
+        )"
+
+        payload="$(jq -nc \
+          --arg name "${check_name}" \
+          --arg head_sha "${GITHUB_SHA}" \
+          --arg details_url "${REPORT_URL_ABSOLUTE}" \
+          --arg title "${REPORT_NAME}" \
+          --arg summary "${summary}" \
+          '{
+            name: $name,
+            head_sha: $head_sha,
+            status: "completed",
+            conclusion: "success",
+            details_url: $details_url,
+            output: { title: $title, summary: $summary }
+          }')"
+
+        response_file="${RUNNER_TEMP}/report-check-response.json"
+        http_code="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+          -X POST "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/check-runs" \
+          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "Content-Type: application/json" \
+          --data "${payload}")"
+
+        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+          echo "Failed to publish commit check. HTTP ${http_code}" >&2
+          cat "${response_file}" >&2
+          echo "Ensure workflow permissions include checks: write." >&2
+          exit 1
+        fi
