@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - codex/oidc-submit-validation
+      - develop
+      - test
+      - qa
 
 permissions:
   contents: read
