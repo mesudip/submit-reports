@@ -1,0 +1,67 @@
+name: Validate OIDC Report Upload
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/oidc-submit-validation
+
+permissions:
+  contents: read
+  id-token: write
+  checks: write
+
+env:
+  REPORT_SERVER_URL: dane-perfect-quagga.ngrok-free.app
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest allure-pytest
+
+      - name: Generate allure results
+        run: |
+          pytest tests --alluredir allure-results || true
+
+      - name: Submit report with OIDC
+        id: submit
+        uses: ./
+        with:
+          server-url: ${{ env.REPORT_SERVER_URL }}
+          path: allure-results
+          report-name: validation-suite
+          branch: ${{ github.ref_name }}
+          report-type: allure
+
+      - name: Build validation artifact
+        run: |
+          cat > upload-validation.json <<JSON
+          {
+            "repository": "${{ github.repository }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "report_version_id": "${{ steps.submit.outputs.report-version-id }}",
+            "report_url": "${{ steps.submit.outputs.report-url }}",
+            "project_name": "${{ steps.submit.outputs.project-name }}"
+          }
+          JSON
+
+      - name: Upload validation artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: upload-validation
+          path: |
+            upload-validation.json
+            upload-response.json
