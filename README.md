@@ -11,14 +11,15 @@ permissions:
 
 steps:
   - uses: actions/checkout@v6
-  - uses: ./
+  - uses: mesudip/submit-reports@v1
     with:
       server-url: your-host
       path: allure-results
       report-type: allure
       report-name: unit-tests
-      branch: ${{ github.ref_name }}
 ```
+
+Note: use `./` only when you are developing this action inside the same repository.
 
 ## Inputs
 - `server-url` (required): report host only (with or without scheme). Examples: `your-host`, `https://your-host`, `localhost:8080`
